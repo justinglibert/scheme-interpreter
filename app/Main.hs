@@ -1,11 +1,42 @@
 module Main where
-
 import           Control.Monad
+import           Data.Functor
 import           Numeric
 import           System.Environment
 import           Text.Parsec             hiding ( spaces )
 import           Text.Parsec.String
 import           Text.Parsec.Combinator
+import           Control.Monad.Except
+
+-- Types
+
+data LispError = NumArgs Integer [LispVal]
+               | TypeMismatch String LispVal
+               | ParserE ParseError
+               | BadSpecialForm String LispVal
+               | NotFunction String String
+               | UnboundVar String String
+               | Default String
+
+showError :: LispError -> String
+showError (UnboundVar     message varname) = message ++ ": " ++ varname
+showError (BadSpecialForm message form   ) = message ++ ": " ++ show form
+showError (NotFunction    message func   ) = message ++ ": " ++ show func
+showError (NumArgs expected found) =
+  "Expected " ++ show expected ++ " args; found values " ++ unwordsList found
+showError (TypeMismatch expected found) =
+  "Invalid type: expected " ++ expected ++ ", found " ++ show found
+showError (ParserE parseErr) = "Parse error at " ++ show parseErr
+
+instance Show LispError where
+  show = showError
+
+type ThrowsError = Either LispError
+
+trapError action = catchError action (return . show)
+
+extractValue :: ThrowsError a -> a
+extractValue (Right val) = val
 
 data LispVal
   = Atom String
@@ -16,8 +47,7 @@ data LispVal
   | String String
   | Bool Bool
 
-instance Show LispVal where
-  show = showVal
+-- Parsing
 
 symbol :: Parser Char
 symbol = oneOf "!#$%&|*+-/:<=>?@^_~"
@@ -55,34 +85,21 @@ parseNumberHex = do
   let out = Number . readSingleHex $ n
   return out
 
--- Ex 1 1
--- parseNumber' :: Parser LispVal
--- parseNumber' = do
---   n <- many1 digit
---   let out = Number . read $ n
---   return out
---
--- parseNumber'' :: Parser LispVal
--- parseNumber'' = many1 digit >>= prep
---   where
---     prep x = pure $ (Number . read) x
--- / Ex 1 1
-
 parseNumber :: Parser LispVal
 parseNumber = parseNumberDec <|> parseNumberHex
 
-readSingleFloat :: String -> Float
+readSingleFloat :: String -> Maybe Float
 readSingleFloat x = case readFloat x of
-  []         -> error "Error while parsing float"
-  [(val, _)] -> val
+  []         -> Nothing
+  [(val, _)] -> Just val
 
 parseFloat :: Parser LispVal
 parseFloat = do
   i <- many1 digit
   char '.'
   d <- many1 digit
-  let out = Float . readSingleFloat $ i ++ "." ++ d
-  return out
+  let val = readSingleFloat $ i ++ "." ++ d
+  maybe (fail "Could not parse this float") (return . Float) val
 
 parseNumberOrFloat :: Parser LispVal
 parseNumberOrFloat = try parseFloat <|> parseNumber
@@ -112,15 +129,12 @@ parseExpr =
     char ')'
     return x
 
-readExpr :: String -> LispVal
+readExpr :: String -> ThrowsError LispVal
 readExpr input = case parse parseExpr "lisp" input of
-  Left  err -> String $ "No match: " ++ show err
-  Right val -> val
+  Left  err -> throwError $ ParserE err
+  Right val -> return val
 
--- Evaluation
-
-unwordsList :: [LispVal] -> String
-unwordsList = unwords . map showVal
+-- Pretty Printing
 
 showVal :: LispVal -> String
 showVal (String contents) = "\"" ++ contents ++ "\""
@@ -133,18 +147,32 @@ showVal (List   contents) = "(" ++ unwordsList contents ++ ")"
 showVal (DottedList head tail) =
   "(" ++ unwordsList head ++ " . " ++ showVal tail ++ ")"
 
-eval :: LispVal -> LispVal
-eval val@(String _                  ) = val
-eval val@(Number _                  ) = val
-eval val@(Bool   _                  ) = val
-eval val@(Float  _                  ) = val
-eval (    List   [Atom "quote", val]) = val
-eval (    List   (Atom func : args) ) = apply func $ map eval args
+unwordsList :: [LispVal] -> String
+unwordsList = unwords . map showVal
 
-apply :: String -> [LispVal] -> LispVal
-apply func args = maybe (Bool False) ($ args) $ lookup func primitives
+instance Show LispVal where
+  show = showVal
 
-primitives :: [(String, [LispVal] -> LispVal)]
+-- Evaluation
+
+
+eval :: LispVal -> ThrowsError LispVal
+eval val@(String _                  ) = return val
+eval val@(Number _                  ) = return val
+eval val@(Bool   _                  ) = return val
+eval val@(Float  _                  ) = return val
+eval (    List   [Atom "quote", val]) = return val
+eval (    List   (Atom func : args) ) = mapM eval args >>= apply func
+eval badForm = throwError $ BadSpecialForm "Unrecognized Form" badForm
+
+apply :: String -> [LispVal] -> ThrowsError LispVal
+apply func args =
+  maybe (throwError $ NotFunction "Unrecognized primitive function" func)
+        ($ args)
+    $ lookup func primitives
+
+
+primitives :: [(String, [LispVal] -> ThrowsError LispVal)]
 primitives =
   [ ("+"        , numericBinop (+))
   , ("-"        , numericBinop (-))
@@ -155,21 +183,34 @@ primitives =
   , ("remainder", numericBinop rem)
   ]
 
-numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] -> LispVal
-numericBinop op params = Number $ foldl1 op $ map unpackNum params
+numericBinop
+  :: (Integer -> Integer -> Integer) -> [LispVal] -> ThrowsError LispVal
+numericBinop op []            = throwError $ NumArgs 2 []
+numericBinop op singleVal@[_] = throwError $ NumArgs 2 singleVal
+numericBinop op params        = Number . foldl1 op <$> mapM unpackNum params
 
-unpackNum :: LispVal -> Integer
+unpackNum :: LispVal -> ThrowsError Integer
 -- TODO hack until I figure out how to do float stuff
-unpackNum (Float  n) = round n
-unpackNum (Number n) = n
+unpackNum (Float  n) = return $ round n
+unpackNum (Number n) = return n
 unpackNum (String n) =
   let parsed = reads n :: [(Integer, String)]
-  in  if null parsed then 0 else fst . head $ parsed
+  in  if null parsed
+        then throwError $ TypeMismatch "number" $ String n
+        else return $ fst . head $ parsed
 unpackNum (List [n]) = unpackNum n
-unpackNum _          = 0
+unpackNum notNum     = throwError $ TypeMismatch "number" notNum
+
+-- Shortcut to quickly eval a string in the Repl
+s = scheme
+
+scheme :: String -> IO ()
+scheme i = do
+  let evaled = show <$> (readExpr i >>= eval)
+  putStrLn $ extractValue $ trapError evaled
 
 main :: IO ()
-main = getArgs >>= print . evalExpr . head
-
-evalExpr :: String -> LispVal
-evalExpr = eval . readExpr
+main = do
+  [a] <- getArgs
+  let evaled = show <$> (readExpr a >>= eval)
+  putStrLn $ extractValue $ trapError evaled
