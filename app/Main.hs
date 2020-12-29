@@ -212,5 +212,4 @@ scheme i = do
 main :: IO ()
 main = do
   [a] <- getArgs
-  let evaled = show <$> (readExpr a >>= eval)
-  putStrLn $ extractValue $ trapError evaled
+  scheme a
